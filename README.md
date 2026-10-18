@@ -37,9 +37,11 @@ A numbered account is one Codex identity in the package vault.
 
 ## Flow
 
-- Before the first agent start, only fresh quota snapshots enter startup ranking. The account with the most seven-day quota wins.
+The flowchart above shows the default behavior with both automatic switches enabled.
+
+- With `autoSelectOnStartup` enabled, before the first agent start, only fresh quota snapshots enter startup ranking. The account with the most seven-day quota wins.
 - An explicit `/codex-switch` account selection always wins for the next agent start; selecting a Codex model does not pin an account.
-- Before later agent starts, a known active five-hour block switches to the eligible fresh account with the most seven-day quota.
+- With `autoSelectOnStartup` enabled, before later agent starts, a known active five-hour block switches to the eligible fresh account with the most seven-day quota.
 - After HTTP 429, failover can use authenticated, scope-allowed, untried accounts with stale or missing quota.
 - Failover skips known active five-hour blocks. It ranks fresh known quota first, then unranked accounts by account number.
 - Routing keeps the model ID and the `openai-codex` provider. It changes `accounts.json` `activeAccountId` only.
@@ -53,9 +55,23 @@ Package-owned: `~/.pi/agent/config/pi-multi-codex/config.json`
 
 | Name | Description | Values | Default |
 | --- | --- | --- | --- |
+| `autoSelectOnStartup` | Selects the account with the most weekly quota before the first agent start, and switches away from known five-hour blocks before later starts. | Boolean. | `true` |
 | `autoSwitchOn429` | Switches to another eligible account after an HTTP 429. | Boolean. | `true` |
 
-Set `autoSwitchOn429` to `false` to disable automatic switching. The config must contain only this field as a boolean. Invalid config is preserved and disables automatic switching.
+To keep the current account instead of automatically selecting by weekly quota:
+
+```json
+{
+  "autoSelectOnStartup": false,
+  "autoSwitchOn429": true
+}
+```
+
+`/codex-switch`, quota refreshes, and quota displays still work. HTTP 429 failover is controlled separately by `autoSwitchOn429`; set both fields to `false` to disable all automatic account switching.
+
+Existing configs containing only `autoSwitchOn429` remain valid and default `autoSelectOnStartup` to `true`. The config must contain `autoSwitchOn429` and may contain `autoSelectOnStartup`, both as booleans; no other fields are allowed. Invalid config is preserved and disables both automatic switches.
+
+Run `/reload` or restart Pi after changing the config. Account selection is shared across sessions: other sessions with automatic switching enabled can still change the global active account.
 
 ## State and storage
 

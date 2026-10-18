@@ -154,7 +154,7 @@ async function withApp(
 				async select(_title: string, choices: string[]) { return choices[1]; },
 			},
 		};
-		multiCodex({
+		await multiCodex({
 			on(event: string, handler: Handler) { handlers.set(event, handler); },
 			registerCommand(name: string, command: { handler: Command }) { commands.set(name, command.handler); },
 			registerProvider(provider: { id: string }) { providers.push(provider); },
@@ -192,12 +192,16 @@ async function withApp(
 	}
 }
 
-test("registers exactly one openai-codex provider", async () => {
+test("registers exactly one openai-codex provider with the host catalog and APIs", async () => {
 	await withApp({ 1: 40, 2: 70 }, [], async ({ handlers, ctx, providers }) => {
 		await handlers.get("session_start")?.({ type: "session_start" }, ctx);
 		assert.equal(providers.length, 1);
-		assert.equal(providers[0].id, "openai-codex");
-		assert.equal(typeof providers[0].getModels, "function");
+		const expected = builtinProviders().find((provider) => provider.id === "openai-codex");
+		assert.ok(expected);
+		assert.equal(providers[0].id, expected.id);
+		assert.equal(providers[0].baseUrl, expected.baseUrl);
+		assert.equal(providers[0].auth.oauth.name, expected.auth.oauth?.name);
+		assert.deepEqual(providers[0].getModels(), expected.getModels());
 		assert.equal(typeof providers[0].stream, "function");
 		assert.equal(typeof providers[0].streamSimple, "function");
 		assert.equal(typeof providers[0].auth?.oauth?.toAuth, "function");
@@ -394,6 +398,91 @@ test("routes once at first agent boundary from fresh seven-day cache", async () 
 		await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
 		assert.equal(activeIndex(await readVault(agentDir)), 2);
 	});
+});
+
+test("legacy config keeps startup ranking enabled", async () => {
+	await withApp({ 1: 40, 2: 90 }, [], async ({ agentDir, handlers, ctx, notices }) => {
+		await writeFile(extensionConfigPath("pi-multi-codex", agentDir), '{"autoSwitchOn429":false}\n');
+		await handlers.get("session_start")?.({ type: "session_start" }, ctx);
+		await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
+		assert.equal(activeIndex(await readVault(agentDir)), 2);
+		assert.doesNotMatch(notices.join("\n"), /config is invalid/);
+	});
+});
+
+test("autoSelectOnStartup true ranks accounts independently of 429 switching", async () => {
+	await withApp({ 1: 40, 2: 90 }, [], async ({ agentDir, handlers, ctx, notices }) => {
+		await writeFile(extensionConfigPath("pi-multi-codex", agentDir), JSON.stringify({ autoSelectOnStartup: true, autoSwitchOn429: false }));
+		await handlers.get("session_start")?.({ type: "session_start" }, ctx);
+		await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
+		assert.equal(activeIndex(await readVault(agentDir)), 2);
+		assert.doesNotMatch(notices.join("\n"), /config is invalid/);
+	});
+});
+
+test("autoSelectOnStartup false keeps the active account across starts and five-hour blocks but allows manual switching", async () => {
+	await withApp({ 1: 40, 2: 90 }, [], async ({ agentDir, handlers, commands, ctx, notices, statuses }) => {
+		await writeFile(extensionConfigPath("pi-multi-codex", agentDir), JSON.stringify({ autoSelectOnStartup: false, autoSwitchOn429: true }));
+		await handlers.get("session_start")?.({ type: "session_start" }, ctx);
+		await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
+		assert.equal(activeIndex(await readVault(agentDir)), 1);
+		assert.match(statuses.at(-1) ?? "", /Codex #1.*40%/);
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+
+		const cache = usagePath(agentDir);
+		const state = JSON.parse(await readFile(cache, "utf8"));
+		state.slots.find((snapshot: { slot: number }) => snapshot.slot === 1).limitedUntil = Date.now() + 60_000;
+		await writeFile(cache, JSON.stringify(state));
+		await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
+		assert.equal(activeIndex(await readVault(agentDir)), 1);
+
+		await commands.get("codex-switch")?.("", ctx);
+		await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
+		assert.equal(activeIndex(await readVault(agentDir)), 2);
+		assert.equal(ctx.model.provider, "openai-codex");
+		assert.equal(ctx.model.id, "gpt-5.3-codex");
+		assert.doesNotMatch(notices.join("\n"), /config is invalid/);
+	});
+});
+
+test("autoSelectOnStartup false does not disable HTTP 429 failover", async () => {
+	await withApp({ 1: 40, 2: 90 }, [], async ({ agentDir, handlers, ctx, notices }) => {
+		await writeFile(extensionConfigPath("pi-multi-codex", agentDir), JSON.stringify({ autoSelectOnStartup: false, autoSwitchOn429: true }));
+		await handlers.get("session_start")?.({ type: "session_start" }, ctx);
+		await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
+		assert.equal(activeIndex(await readVault(agentDir)), 1);
+
+		handlers.get("before_provider_request")?.({ type: "before_provider_request", payload: {} }, ctx);
+		handlers.get("after_provider_response")?.({ type: "after_provider_response", status: 429, headers: {} }, ctx);
+		const retry = await handlers.get("message_end")?.({ type: "message_end", message: assistantError() }, ctx) as any;
+		assert.equal(activeIndex(await readVault(agentDir)), 2);
+		assert.match(retry.message.errorMessage, /account switched/);
+		assert.doesNotMatch(notices.join("\n"), /config is invalid/);
+	});
+});
+
+test("invalid startup config is preserved and disables both automatic routes", async () => {
+	for (const config of [
+		{ autoSwitchOn429: true, autoSelectOnStartup: "false" },
+		{ autoSwitchOn429: true, autoSelectOnStartup: false, unknown: true },
+	]) {
+		await withApp({ 1: 40, 2: 90 }, [], async ({ agentDir, handlers, ctx, notices }) => {
+			const path = extensionConfigPath("pi-multi-codex", agentDir);
+			const original = JSON.stringify(config);
+			await writeFile(path, original);
+			await handlers.get("session_start")?.({ type: "session_start" }, ctx);
+			await handlers.get("before_agent_start")?.({ type: "before_agent_start" }, ctx);
+			assert.equal(activeIndex(await readVault(agentDir)), 1);
+			assert.match(notices.join("\n"), /config is invalid/);
+			assert.equal(await readFile(path, "utf8"), original);
+
+			handlers.get("before_provider_request")?.({ type: "before_provider_request", payload: {} }, ctx);
+			handlers.get("after_provider_response")?.({ type: "after_provider_response", status: 429, headers: {} }, ctx);
+			const result = await handlers.get("message_end")?.({ type: "message_end", message: assistantError() }, ctx);
+			assert.equal(result, undefined);
+			assert.equal(activeIndex(await readVault(agentDir)), 1);
+		});
+	}
 });
 
 test("explicit Codex model selection does not disable account ranking", async () => {

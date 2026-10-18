@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import * as nodeModule from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { createConfigStore, extensionConfigDir, writePrivateTextFileAtomically } from "@henryqw/pi-config-store";
 import { lock } from "proper-lockfile";
@@ -9,9 +11,9 @@ import {
 	type Model,
 	type Provider,
 } from "@earendil-works/pi-ai";
-import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
 	getAgentDir,
+	getPackageDir,
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -80,7 +82,7 @@ type AccountVault = {
 };
 
 type ParsedUsage = { remaining: number; reset: number; fiveHourReset?: number; limitedUntil?: number; tier?: string };
-type Config = { autoSwitchOn429: boolean };
+type Config = { autoSelectOnStartup: boolean; autoSwitchOn429: boolean };
 
 const NATIVE_PROVIDER_ID = "openai-codex";
 const CODEX_ALIAS_PATTERN = /^openai-codex-([2-9]|[1-9]\d+)$/;
@@ -101,10 +103,15 @@ const mutexPath = (file: string) => `${file}.mutex`;
 const refreshes = new Map<string, Promise<CodexOAuthCredential | undefined>>();
 const migratingByDir = new Map<string, Promise<void>>();
 function parseConfig(value: unknown): Config {
-	if (!isRecord(value) || Object.keys(value).length !== 1 || typeof value.autoSwitchOn429 !== "boolean") {
-		throw new Error("Config must contain only autoSwitchOn429:boolean.");
+	if (
+		!isRecord(value)
+		|| Object.keys(value).some((key) => key !== "autoSwitchOn429" && key !== "autoSelectOnStartup")
+		|| typeof value.autoSwitchOn429 !== "boolean"
+		|| (value.autoSelectOnStartup !== undefined && typeof value.autoSelectOnStartup !== "boolean")
+	) {
+		throw new Error("Config must contain autoSwitchOn429:boolean and optional autoSelectOnStartup:boolean only.");
 	}
-	return { autoSwitchOn429: value.autoSwitchOn429 };
+	return { autoSwitchOn429: value.autoSwitchOn429, autoSelectOnStartup: value.autoSelectOnStartup ?? true };
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -1080,14 +1087,34 @@ function sessionHasAgentWork(ctx: ExtensionContext): boolean {
 	) ?? false;
 }
 
-export default function multiCodex(pi: ExtensionAPI): void {
-	const native = builtinProviders().find((provider) => provider.id === NATIVE_PROVIDER_ID) as CodexProvider | undefined;
+export default async function multiCodex(pi: ExtensionAPI): Promise<void> {
+	// Resolve against Pi itself: the extension's peer dependency may have an older model catalog.
+	let providerPackage: string | undefined;
+	// Bun binaries have virtual modules, but do not expose Node's package locator.
+	if (typeof nodeModule.findPackageJSON === "function") {
+		try {
+			providerPackage = nodeModule.findPackageJSON("@earendil-works/pi-ai/providers/openai-codex", join(getPackageDir(), "package.json"));
+		} catch (error) {
+			if (!isRecord(error) || error.code !== "ERR_MODULE_NOT_FOUND") throw error;
+		}
+	}
+	let native: CodexProvider | undefined;
+	if (providerPackage) {
+		const metadata = JSON.parse(readFileSync(providerPackage, "utf8"));
+		const entry = metadata.exports["./providers/*"].import.replace("*", "openai-codex");
+		const { openaiCodexProvider } = await import(pathToFileURL(join(dirname(providerPackage), entry)).href) as typeof import("@earendil-works/pi-ai/providers/openai-codex");
+		native = openaiCodexProvider();
+	} else {
+		// Compiled runtimes can expose virtual modules without separate provider files.
+		const { builtinProviders } = await import("@earendil-works/pi-ai/providers/all");
+		native = builtinProviders().find((provider) => provider.id === NATIVE_PROVIDER_ID) as CodexProvider | undefined;
+	}
 	const oauth = native?.auth.oauth;
 	if (!native || !oauth) return;
 	const quota = new CodexQuotaStatus();
 	const configStore = createConfigStore<Config>({
 		extensionId: "pi-multi-codex",
-		defaults: () => ({ autoSwitchOn429: true }),
+		defaults: () => ({ autoSelectOnStartup: true, autoSwitchOn429: true }),
 		parse: parseConfig,
 	});
 	const triedSlots = new Set<number>();
@@ -1095,6 +1122,7 @@ export default function multiCodex(pi: ExtensionAPI): void {
 	let automaticOpen = false;
 	let automaticIndex: number | undefined;
 	let preserveModelChoice = false;
+	let autoSelectOnStartup = true;
 	let autoSwitchOn429 = true;
 	let configWarned = false;
 	let providerRequest: { provider?: string; model?: string; index?: number; status?: number } | undefined;
@@ -1184,7 +1212,7 @@ export default function multiCodex(pi: ExtensionAPI): void {
 	};
 
 	const updatePendingCandidate = (ctx: ExtensionContext): void => {
-		if (!ctx.model || !isManagedProvider(ctx.model.provider)) return;
+		if (!autoSelectOnStartup || !ctx.model || !isManagedProvider(ctx.model.provider)) return;
 		automaticIndex = selectFreshSlot(ctx, ctx.model);
 	};
 
@@ -1201,15 +1229,16 @@ export default function multiCodex(pi: ExtensionAPI): void {
 		providerRequest = undefined;
 		preserveModelChoice = false;
 		try {
-			autoSwitchOn429 = configStore.loadSync().value.autoSwitchOn429;
+			({ autoSelectOnStartup, autoSwitchOn429 } = configStore.loadSync().value);
 		} catch {
+			autoSelectOnStartup = false;
 			autoSwitchOn429 = false;
 			if (!configWarned) {
 				configWarned = true;
-				ctx.ui.notify("Pi Multi Codex config is invalid. Automatic 429 switching is disabled; the file was left unchanged.", "warning");
+				ctx.ui.notify("Pi Multi Codex config is invalid. Automatic account selection and 429 switching are disabled; the file was left unchanged.", "warning");
 			}
 		}
-		automaticOpen = isManagedProvider(ctx.model?.provider) && !sessionHasAgentWork(ctx);
+		automaticOpen = autoSelectOnStartup && isManagedProvider(ctx.model?.provider) && !sessionHasAgentWork(ctx);
 		automaticIndex = activeIndexSync();
 		updatePendingCandidate(ctx);
 		updateFooter(ctx);
@@ -1227,6 +1256,7 @@ export default function multiCodex(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (_event, ctx) => {
 		triedSlots.clear();
 		providerRequest = undefined;
+		if (!autoSelectOnStartup) return;
 		const model = ctx.model;
 		const slot = activeIndexSync();
 		const identity = slot ? currentIdentity(slot) : undefined;
